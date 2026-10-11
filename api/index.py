@@ -26,7 +26,13 @@ def env_by_suffix(*suffixes: str) -> str | None:
     return None
 
 
-TARGETS = parse_targets(os.getenv("TARGETS", "https://x1.com,https://x2.com,https://x3.com"))
+DEFAULT_TARGETS = """
+https://site1.com/?q=информация из поиска
+https://site2.com/?q=информация из поиска
+https://site3.com/?q=информация из поиска
+"""
+
+TARGETS = parse_targets(os.getenv("TARGETS") or DEFAULT_TARGETS)
 CLICK_TTL = int(os.getenv("CLICK_TTL_DAYS", "30")) * 86400
 KV_URL = env_by_suffix("KV_REST_API_URL", "UPSTASH_REDIS_REST_URL")
 KV_TOKEN = env_by_suffix("KV_REST_API_TOKEN", "UPSTASH_REDIS_REST_TOKEN")
