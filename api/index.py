@@ -17,7 +17,7 @@ cookies_rotator: основной домен -> X1/X2/X3 строго по кр�
 INCR атомарный, поэтому 900 кликов = ровно 300/300/300.
 
 ENV:
-  TARGETS             через запятую (default: https://x1.com,https://x2.com,https://x3.com)
+  TARGETS             ссылки через запятую или по одной на строку, можно с путём и параметрами
   STATS_TOKEN         секрет для /stats и /reset (обязателен)
   KV_REST_API_URL     Upstash Redis REST url   (Vercel Marketplace -> Upstash, любой префикс)
   KV_REST_API_TOKEN   Upstash Redis REST token
@@ -28,17 +28,21 @@ import os
 import random
 import time
 import uuid
-from urllib.parse import urlencode
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 
-TARGETS = [
-    t.strip().rstrip("/")
-    for t in os.getenv("TARGETS", "https://x1.com,https://x2.com,https://x3.com").split(",")
-    if t.strip()
-]
+def _parse_targets(raw: str) -> list[str]:
+    # Ссылки можно писать с путём и своими параметрами: https://site.com/page?lp=a
+    # Разделитель: перевод строки, а если строк нет, то запятая (запятая внутри ссылки
+    # тогда не сломает список, если писать по одной ссылке на строку).
+    parts = raw.splitlines() if "\n" in raw.strip() else raw.split(",")
+    return [p.strip().rstrip("/") for p in parts if p.strip()]
+
+
+TARGETS = _parse_targets(os.getenv("TARGETS", "https://x1.com,https://x2.com,https://x3.com"))
 CLICK_TTL = int(os.getenv("CLICK_TTL_DAYS", "30")) * 86400
 
 PIXEL = base64.b64decode("R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7")
@@ -138,11 +142,15 @@ def check_token(token: str | None):
 
 
 def target_url(target: str, request: Request, cid: str | None) -> str:
-    params = dict(request.query_params)
+    """Собирает ссылку: путь и параметры целевой ссылки сохраняются (они главнее),
+    сверху докидываются входящие параметры (subid, utm_*...) и cid."""
+    p = urlparse(target)
+    params = dict(parse_qsl(p.query, keep_blank_values=True))
+    for k, v in request.query_params.items():
+        params.setdefault(k, v)
     if cid:
         params["cid"] = cid
-    qs = urlencode(params)
-    return f"{target}/?{qs}" if qs else f"{target}/"
+    return urlunparse(p._replace(path=p.path or "/", query=urlencode(params)))
 
 
 # ---------- routes ----------

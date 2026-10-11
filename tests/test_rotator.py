@@ -56,3 +56,31 @@ async def main():
         assert resp.status_code == 302 and resp.headers["x-rotator-fallback"] == "random"
         print("ALL OK")
 asyncio.run(main())
+
+# Полные ссылки с путём и своими параметрами
+def test_full_urls():
+    os.environ["TARGETS"] = "https://a.com/landing?lp=a&q=hello\nhttps://b.com/new\nhttps://c.com"
+    import importlib; importlib.reload(index)
+    assert index.TARGETS == ["https://a.com/landing?lp=a&q=hello", "https://b.com/new", "https://c.com"]
+    index.kv = fake_kv
+    async def run():
+        await r.flushall()
+        tr = httpx.ASGITransport(app=index.app)
+        async with httpx.AsyncClient(transport=tr, base_url="https://rot.test") as c:
+            UA = {"user-agent": "Mozilla/5.0"}
+            locs = [(await c.get("/?subid=7&lp=zzz", headers=UA)).headers["location"] for _ in range(6)]
+            for l in locs: print(l)
+            a = urlparse(locs[0]); qa = parse_qs(a.query)
+            assert a.hostname == "a.com" and a.path == "/landing"
+            assert qa["lp"] == ["a"] and qa["q"] == ["hello"] and qa["subid"] == ["7"] and len(qa["cid"][0]) == 32
+            assert urlparse(locs[1]).path == "/new" and urlparse(locs[2]).path == "/"
+            assert [urlparse(l).hostname for l in locs] == ["a.com", "b.com", "c.com"] * 2
+            cid = parse_qs(a.query)["cid"][0]
+            await c.get(f"/t/arrive?cid={cid}&host=a.com")
+            s = (await c.get("/stats?token=secret")).json()
+            t = s["targets"]["https://a.com/landing?lp=a&q=hello"]
+            assert t["sent"] == 2 and t["arrived"] == 1 and t["host_mismatch"] == 0
+            print("FULL URLS OK")
+    asyncio.run(run())
+
+test_full_urls()
