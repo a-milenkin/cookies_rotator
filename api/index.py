@@ -44,8 +44,19 @@ def load_variants() -> list[dict]:
 
 
 # ---------- tiny Upstash REST client ----------
-KV_URL = os.getenv("KV_REST_API_URL") or os.getenv("UPSTASH_REDIS_REST_URL")
-KV_TOKEN = os.getenv("KV_REST_API_TOKEN") or os.getenv("UPSTASH_REDIS_REST_TOKEN")
+def _env_suffix(*suffixes):
+    # accepts KV_REST_API_URL, UPSTASH_REDIS_REST_URL or any custom prefix like STORAGE_KV_REST_API_URL
+    for s in suffixes:
+        if os.getenv(s):
+            return os.getenv(s)
+    for k, v in os.environ.items():
+        if v and any(k.endswith(s) for s in suffixes):
+            return v
+    return None
+
+
+KV_URL = _env_suffix("KV_REST_API_URL", "UPSTASH_REDIS_REST_URL")
+KV_TOKEN = _env_suffix("KV_REST_API_TOKEN", "UPSTASH_REDIS_REST_TOKEN")
 
 
 async def kv(*cmd):
