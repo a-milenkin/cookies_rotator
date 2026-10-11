@@ -1,51 +1,62 @@
 """
-MnogoReels landing rotator (FastAPI on Vercel).
+cookies_rotator: основной домен -> X1/X2/X3 строго по кругу (round-robin)
++ трекинг доставки трафика до целевого сайта. FastAPI на Vercel + Upstash Redis.
 
-Round-robin / weighted split of paid traffic across your own landing variants,
-pass-through of tracking params (subid, zone, utm_*), click + conversion stats.
+Поток:
+  1. Пользователь заходит на https://<rotator>/?utm_source=...
+  2. Один атомарный Lua-скрипт в Redis: INCR счётчика -> выбор домена (n % 3)
+     -> запись клика с уникальным cid -> +1 в "отправлено" по домену.
+  3. 302 на https://x1.com/?utm_source=...&cid=<cid>
+  4. На целевом сайте стоит <script src="https://<rotator>/t.js" async></script>,
+     скрипт берёт cid из URL и дёргает пиксель /t/arrive?cid=...&host=x1.com
+     -> отмечаем, что трафик реально дошёл (засчитывается только первый раз).
+  5. /stats: сколько отправлено, сколько дошло, по каждому домену.
+
+Почему Redis: на Vercel каждый запрос может попасть в новый инстанс, память и
+файлы (SQLite) между ними не шарятся. Счётчик в Redis общий для всех инстансов,
+INCR атомарный, поэтому 900 кликов = ровно 300/300/300.
 
 ENV:
-  VARIANTS            JSON list: [{"id":"a","url":"https://mnogo-reels.ru/?lp=a","weight":1}, ...]
-  ALLOWED_HOSTS       comma list of allowed destination hosts (default: mnogo-reels.ru)
-  STATS_TOKEN         secret for /stats and /postback
-  KV_REST_API_URL     Upstash Redis REST url   (optional, Vercel Marketplace -> Upstash)
-  KV_REST_API_TOKEN   Upstash Redis REST token (optional)
-Without Redis the split is weighted-random (serverless instances share no memory).
+  TARGETS             через запятую (default: https://x1.com,https://x2.com,https://x3.com)
+  STATS_TOKEN         секрет для /stats и /reset (обязателен)
+  KV_REST_API_URL     Upstash Redis REST url   (Vercel Marketplace -> Upstash, любой префикс)
+  KV_REST_API_TOKEN   Upstash Redis REST token
+  CLICK_TTL_DAYS      сколько хранить клики (default 30)
 """
-import json
+import base64
 import os
 import random
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+import time
+import uuid
+from urllib.parse import urlencode
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import JSONResponse, RedirectResponse, Response
 
-app = FastAPI(title="mnogo-rotator")
+TARGETS = [
+    t.strip().rstrip("/")
+    for t in os.getenv("TARGETS", "https://x1.com,https://x2.com,https://x3.com").split(",")
+    if t.strip()
+]
+CLICK_TTL = int(os.getenv("CLICK_TTL_DAYS", "30")) * 86400
 
-FALLBACK_URL = "https://mnogo-reels.ru/"
-PASS_PARAMS_PREFIX = ("utm_",)
-PASS_PARAMS = {"subid", "zone", "zoneid", "campaign", "cid", "clickid", "geo", "os", "browser"}
+PIXEL = base64.b64decode("R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7")
+NO_CACHE = {"Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"}
 
+# Превью ссылок в мессенджерах и краулеры: редиректим, но в ротацию не пускаем,
+# иначе они съедают очередь и портят ровное распределение.
+BOT_MARKERS = ("bot", "crawler", "spider", "facebookexternalhit", "whatsapp",
+               "telegram", "slack", "preview", "curl", "python-requests", "headless")
 
-def load_variants() -> list[dict]:
-    raw = os.getenv("VARIANTS", "")
-    try:
-        variants = json.loads(raw) if raw else []
-    except json.JSONDecodeError:
-        variants = []
-    allowed = {h.strip().lower() for h in os.getenv("ALLOWED_HOSTS", "mnogo-reels.ru").split(",") if h.strip()}
-    ok = []
-    for v in variants:
-        host = (urlparse(v.get("url", "")).hostname or "").lower()
-        if v.get("id") and any(host == a or host.endswith("." + a) for a in allowed):
-            ok.append({"id": str(v["id"]), "url": v["url"], "weight": max(int(v.get("weight", 1)), 0)})
-    return [v for v in ok if v["weight"] > 0]
+KEYS = ["rr:seq", "rr:sent", "rr:arrived", "rr:delay_ms", "rr:mismatch", "rr:bots"]
+
+app = FastAPI(title="cookies_rotator")
 
 
-# ---------- tiny Upstash REST client ----------
+# ---------- Upstash REST ----------
 def _env_suffix(*suffixes):
-    # accepts KV_REST_API_URL, UPSTASH_REDIS_REST_URL or any custom prefix like STORAGE_KV_REST_API_URL
+    # KV_REST_API_URL, UPSTASH_REDIS_REST_URL или любой префикс вроде STORAGE_KV_REST_API_URL
     for s in suffixes:
         if os.getenv(s):
             return os.getenv(s)
@@ -59,34 +70,65 @@ KV_URL = _env_suffix("KV_REST_API_URL", "UPSTASH_REDIS_REST_URL")
 KV_TOKEN = _env_suffix("KV_REST_API_TOKEN", "UPSTASH_REDIS_REST_TOKEN")
 
 
+class KVError(Exception):
+    pass
+
+
 async def kv(*cmd):
+    """Одна команда Redis через Upstash REST. Бросает KVError, если Redis недоступен."""
     if not (KV_URL and KV_TOKEN):
-        return None
+        raise KVError("redis not configured")
     try:
-        async with httpx.AsyncClient(timeout=1.5) as c:
-            r = await c.post(KV_URL, headers={"Authorization": f"Bearer {KV_TOKEN}"}, json=list(cmd))
-            return r.json().get("result")
-    except Exception:
-        return None
+        async with httpx.AsyncClient(timeout=2.0) as c:
+            r = await c.post(KV_URL, headers={"Authorization": f"Bearer {KV_TOKEN}"},
+                             json=[str(x) for x in cmd])
+            data = r.json()
+    except Exception as e:
+        raise KVError(str(e)) from e
+    if "error" in data:
+        raise KVError(data["error"])
+    return data.get("result")
 
 
-async def pick(variants: list[dict]) -> dict:
-    # expand by weight: a(2), b(1) -> [a, a, b]
-    wheel = [v for v in variants for _ in range(v["weight"])]
-    n = await kv("INCR", "rot:counter")
-    if isinstance(n, int):
-        return wheel[(n - 1) % len(wheel)]
-    return random.choice(wheel)
+# Клик: счётчик + выбор домена + запись клика + "отправлено" одной атомарной операцией.
+# ARGV: cid, ts_ms, ttl, target1, target2, ...
+LUA_CLICK = """
+local n = redis.call('INCR', 'rr:seq')
+local ntargets = #ARGV - 3
+local target = ARGV[4 + ((n - 1) % ntargets)]
+local key = 'rr:click:' .. ARGV[1]
+redis.call('HSET', key, 't', target, 'ts', ARGV[2], 'seq', n)
+redis.call('EXPIRE', key, ARGV[3])
+redis.call('HINCRBY', 'rr:sent', target, 1)
+return {n, target}
+"""
+
+# Приход: засчитываем только первый пиксель по cid.
+# ARGV: cid, ts_ms, host. Возврат: 0 = неизвестный cid, 1 = повтор, 2 = засчитан.
+LUA_ARRIVE = """
+local key = 'rr:click:' .. ARGV[1]
+local target = redis.call('HGET', key, 't')
+if not target then return 0 end
+if redis.call('HSETNX', key, 'arr', ARGV[2]) == 0 then return 1 end
+redis.call('HSET', key, 'host', ARGV[3])
+redis.call('HINCRBY', 'rr:arrived', target, 1)
+local sent_ts = tonumber(redis.call('HGET', key, 'ts'))
+redis.call('HINCRBY', 'rr:delay_ms', target, tonumber(ARGV[2]) - sent_ts)
+local expected = string.match(target, '^%a+://([^/:]+)')
+if ARGV[3] ~= '' and expected ~= ARGV[3] and ('www.' .. expected) ~= ARGV[3] then
+  redis.call('HINCRBY', 'rr:mismatch', target, 1)
+end
+return 2
+"""
 
 
-def build_target(url: str, incoming: dict, variant_id: str) -> str:
-    p = urlparse(url)
-    q = dict(parse_qsl(p.query))
-    for k, val in incoming.items():
-        if k in PASS_PARAMS or k.startswith(PASS_PARAMS_PREFIX):
-            q.setdefault(k, val)
-    q["lp"] = variant_id
-    return urlunparse(p._replace(query=urlencode(q)))
+def now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def is_bot(request: Request) -> bool:
+    ua = request.headers.get("user-agent", "").lower()
+    return not ua or any(m in ua for m in BOT_MARKERS)
 
 
 def check_token(token: str | None):
@@ -95,32 +137,64 @@ def check_token(token: str | None):
         raise HTTPException(status_code=403, detail="bad token")
 
 
-# ---------- routes ----------
-@app.get("/go")
-async def go(request: Request):
-    variants = load_variants()
-    if not variants:
-        return RedirectResponse(FALLBACK_URL, status_code=302)
-    v = await pick(variants)
+def target_url(target: str, request: Request, cid: str | None) -> str:
     params = dict(request.query_params)
-    await kv("HINCRBY", "rot:clicks", v["id"], 1)
-    if params.get("subid"):
-        await kv("SET", f"rot:sub:{params['subid']}", v["id"], "EX", 60 * 60 * 24 * 30)
-    resp = RedirectResponse(build_target(v["url"], params, v["id"]), status_code=302)
-    resp.headers["Cache-Control"] = "no-store"
-    return resp
+    if cid:
+        params["cid"] = cid
+    qs = urlencode(params)
+    return f"{target}/?{qs}" if qs else f"{target}/"
 
 
-@app.get("/postback")
-async def postback(subid: str, token: str | None = None, lp: str | None = None):
-    """Call from your backend on signup/payment: /postback?subid=XXX&token=...
-    (lp is optional if subid was seen on /go)."""
-    check_token(token)
-    variant = lp or await kv("GET", f"rot:sub:{subid}")
-    if not variant:
-        return {"ok": False, "reason": "unknown subid"}
-    await kv("HINCRBY", "rot:conv", variant, 1)
-    return {"ok": True, "variant": variant}
+# ---------- routes ----------
+@app.api_route("/", methods=["GET", "HEAD"])
+async def redirect(request: Request):
+    # HEAD (проверки ссылок) и боты не участвуют в ротации
+    if request.method == "HEAD":
+        return Response(status_code=200, headers=NO_CACHE)
+    if is_bot(request):
+        try:
+            await kv("INCR", "rr:bots")
+        except KVError:
+            pass
+        return RedirectResponse(target_url(TARGETS[0], request, None), status_code=302, headers=NO_CACHE)
+
+    cid = uuid.uuid4().hex
+    try:
+        _, target = await kv("EVAL", LUA_CLICK, 0, cid, now_ms(), CLICK_TTL, *TARGETS)
+        headers = NO_CACHE
+    except KVError:
+        # Redis лёг: трафик не теряем, отдаём рандомом и помечаем заголовком
+        target = random.choice(TARGETS)
+        cid = None
+        headers = {**NO_CACHE, "X-Rotator-Fallback": "random"}
+    return RedirectResponse(target_url(target, request, cid), status_code=302, headers=headers)
+
+
+@app.get("/t/arrive")
+async def arrive(cid: str = Query("", max_length=64), host: str = Query("", max_length=255)):
+    """Пиксель подтверждения. Всегда отдаёт GIF, даже если cid кривой."""
+    if len(cid) == 32 and all(c in "0123456789abcdef" for c in cid):
+        try:
+            await kv("EVAL", LUA_ARRIVE, 0, cid, now_ms(), host.lower())
+        except KVError:
+            pass
+    return Response(content=PIXEL, media_type="image/gif", headers=NO_CACHE)
+
+
+@app.get("/t.js")
+async def tracker_js(request: Request):
+    """Сниппет для целевых сайтов: <script src="https://<rotator>/t.js" async></script>"""
+    proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+    host = request.headers.get("host", request.url.netloc)
+    js = """(function(){try{
+var p=new URLSearchParams(location.search),c=p.get('cid'),k='rr_cid';
+if(c){sessionStorage.setItem(k,c);}else{c=sessionStorage.getItem(k);}
+if(!c||sessionStorage.getItem(k+'_sent')===c)return;
+new Image().src='%s://%s/t/arrive?cid='+encodeURIComponent(c)+'&host='+encodeURIComponent(location.hostname)+'&r='+Date.now();
+sessionStorage.setItem(k+'_sent',c);
+}catch(e){}})();""" % (proto, host)
+    return Response(content=js, media_type="application/javascript",
+                    headers={"Cache-Control": "public, max-age=300", "Access-Control-Allow-Origin": "*"})
 
 
 @app.get("/stats")
@@ -128,32 +202,74 @@ async def stats(token: str | None = None):
     check_token(token)
 
     def as_dict(flat):
-        flat = flat or []
-        return {flat[i]: int(flat[i + 1]) for i in range(0, len(flat), 2)}
+        if isinstance(flat, dict):  # некоторые клиенты отдают HGETALL словарём
+            return {k: int(float(v)) for k, v in flat.items()}
+        flat = flat or []  # Upstash REST: плоский список [k1, v1, k2, v2]
+        return {flat[i]: int(float(flat[i + 1])) for i in range(0, len(flat), 2)}
 
-    clicks = as_dict(await kv("HGETALL", "rot:clicks"))
-    conv = as_dict(await kv("HGETALL", "rot:conv"))
-    rows = []
-    for v in load_variants():
-        c, k = clicks.get(v["id"], 0), conv.get(v["id"], 0)
-        rows.append({"id": v["id"], "url": v["url"], "weight": v["weight"],
-                     "clicks": c, "conversions": k, "cr_%": round(100 * k / c, 2) if c else 0})
-    return JSONResponse({"redis": bool(KV_URL and KV_TOKEN), "variants": rows})
+    try:
+        seq = int(await kv("GET", "rr:seq") or 0)
+        bots = int(await kv("GET", "rr:bots") or 0)
+        sent = as_dict(await kv("HGETALL", "rr:sent"))
+        arrived = as_dict(await kv("HGETALL", "rr:arrived"))
+        delay = as_dict(await kv("HGETALL", "rr:delay_ms"))
+        mismatch = as_dict(await kv("HGETALL", "rr:mismatch"))
+    except KVError as e:
+        return JSONResponse({"redis": False, "error": str(e)}, status_code=503)
+
+    by_target = {}
+    for t in TARGETS:
+        s, a = sent.get(t, 0), arrived.get(t, 0)
+        by_target[t] = {
+            "sent": s,
+            "arrived": a,
+            "arrival_rate_pct": round(a / s * 100, 2) if s else 0,
+            "avg_delay_sec": round(delay.get(t, 0) / a / 1000, 3) if a else None,
+            "host_mismatch": mismatch.get(t, 0),
+        }
+
+    sent_counts = [v["sent"] for v in by_target.values()]
+    total_sent, total_arrived = sum(sent_counts), sum(v["arrived"] for v in by_target.values())
+    return {
+        "redis": True,
+        "targets": by_target,
+        "total_sent": total_sent,
+        "total_arrived": total_arrived,
+        "total_arrival_rate_pct": round(total_arrived / total_sent * 100, 2) if total_sent else 0,
+        "distribution_spread": max(sent_counts) - min(sent_counts) if sent_counts else 0,  # 0 или 1 = идеально ровно
+        "counter": seq,
+        "bots_skipped": bots,
+    }
 
 
-@app.get("/")
-async def root():
-    return {"ok": True, "variants": len(load_variants())}
+@app.post("/reset")
+async def reset(token: str | None = None):
+    """Обнулить счётчики перед новым тестом. Сами клики доживут свой TTL."""
+    check_token(token)
+    try:
+        await kv("DEL", *KEYS)
+    except KVError as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=503)
+    return {"ok": True}
+
+
+@app.get("/health")
+async def health():
+    redis_ok = True
+    try:
+        await kv("PING")
+    except KVError:
+        redis_ok = False
+    return {"ok": True, "redis": redis_ok, "targets": TARGETS}
 
 
 @app.api_route("/{rest:path}", methods=["GET", "HEAD"])
 async def not_found(rest: str, request: Request):
-    return JSONResponse({"detail": "Not Found", "path": request.url.path,
-                         "matched": request.headers.get("x-matched-path")}, status_code=404)
+    return JSONResponse({"detail": "Not Found", "path": request.url.path}, status_code=404)
 
 
-# Vercel may hand the function a rewritten path like /api/index or /api/index/go.
-# Normalize it back so routes match regardless of how the platform routes requests.
+# Vercel может отдать функции путь вида /api/index или /api/index/stats.
+# Нормализуем, чтобы роуты матчились при любом роутинге платформы.
 _inner_app = app
 
 
