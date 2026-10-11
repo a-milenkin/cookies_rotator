@@ -144,3 +144,25 @@ async def stats(token: str | None = None):
 @app.get("/")
 async def root():
     return {"ok": True, "variants": len(load_variants())}
+
+
+@app.api_route("/{rest:path}", methods=["GET", "HEAD"])
+async def not_found(rest: str, request: Request):
+    return JSONResponse({"detail": "Not Found", "path": request.url.path,
+                         "matched": request.headers.get("x-matched-path")}, status_code=404)
+
+
+# Vercel may hand the function a rewritten path like /api/index or /api/index/go.
+# Normalize it back so routes match regardless of how the platform routes requests.
+_inner_app = app
+
+
+async def app(scope, receive, send):  # noqa: F811
+    if scope.get("type") in ("http", "websocket"):
+        path = scope.get("path", "")
+        for prefix in ("/api/index.py", "/api/index", "/api"):
+            if path == prefix or path.startswith(prefix + "/"):
+                new = path[len(prefix):] or "/"
+                scope = dict(scope, path=new, raw_path=new.encode())
+                break
+    await _inner_app(scope, receive, send)

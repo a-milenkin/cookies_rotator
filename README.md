@@ -75,5 +75,4 @@ GET https://<проект>.vercel.app/postback?subid=<subid>&token=<STATS_TOKEN>
 ## Файлы
 
 - `api/index.py` - всё приложение
-- `vercel.json` - все пути роутятся в FastAPI
 - `requirements.txt` - fastapi, httpx
