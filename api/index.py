@@ -34,14 +34,7 @@ https://site3.com/?q=информация из поиска
 
 # Ротатор не редиректит платный трафик в ИИ-ассистенты: попандер открывает их
 # у человека, который ничего не просил, и запрос уходит от его имени.
-BLOCKED_HOSTS = (
-    "chatgpt.com", "chat.openai.com", "openai.com", "claude.ai", "anthropic.com",
-    "perplexity.ai", "gemini.google.com", "bard.google.com", "aistudio.google.com",
-    "copilot.microsoft.com", "bing.com", "chat.deepseek.com", "deepseek.com",
-    "grok.com", "x.ai", "chat.mistral.ai", "meta.ai", "poe.com", "you.com",
-    "chat.qwen.ai", "kimi.com", "kimi.moonshot.cn", "giga.chat", "gigachat.ru",
-    "alice.yandex.ru", "ya.ru", "yandex.ru", "character.ai", "huggingface.co",
-)
+BLOCKED_HOSTS = ()
 
 
 def is_blocked(url: str) -> bool:
