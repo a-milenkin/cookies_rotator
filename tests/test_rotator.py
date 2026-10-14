@@ -73,9 +73,20 @@ async def test_full_urls():
     assert (cc.hostname, cc.path) == ("c.com", "/")
 
 
+async def test_go_alias_and_ai_block():
+    index, c = make_client("https://chatgpt.com/?q=x\nhttps://claude.ai/new?q=x\nhttps://www.perplexity.ai/?q=x\nhttps://mnogo-reels.ru/\nhttps://my-site.com/p")
+    assert index.TARGETS == ["https://mnogo-reels.ru", "https://my-site.com/p"] and len(index.BLOCKED_TARGETS) == 3
+    hosts = {urlparse((await c.get("/go?subid=1", headers=UA)).headers["location"]).hostname for _ in range(6)}
+    assert hosts == {"mnogo-reels.ru", "my-site.com"}
+    _, c2 = make_client("https://chatgpt.com/?q=x,https://claude.ai/new?q=y")
+    r = await c2.get("/go", headers=UA)
+    assert r.status_code == 503 and "location" not in r.headers
+
+
 async def main():
     await test_even_split_and_tracking()
     await test_full_urls()
+    await test_go_alias_and_ai_block()
     print("OK")
 
 

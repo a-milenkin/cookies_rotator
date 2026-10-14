@@ -32,7 +32,26 @@ https://site2.com/?q=информация из поиска
 https://site3.com/?q=информация из поиска
 """
 
-TARGETS = parse_targets(os.getenv("TARGETS") or DEFAULT_TARGETS)
+# Ротатор не редиректит платный трафик в ИИ-ассистенты: попандер открывает их
+# у человека, который ничего не просил, и запрос уходит от его имени.
+BLOCKED_HOSTS = (
+    "chatgpt.com", "chat.openai.com", "openai.com", "claude.ai", "anthropic.com",
+    "perplexity.ai", "gemini.google.com", "bard.google.com", "aistudio.google.com",
+    "copilot.microsoft.com", "bing.com", "chat.deepseek.com", "deepseek.com",
+    "grok.com", "x.ai", "chat.mistral.ai", "meta.ai", "poe.com", "you.com",
+    "chat.qwen.ai", "kimi.com", "kimi.moonshot.cn", "giga.chat", "gigachat.ru",
+    "alice.yandex.ru", "ya.ru", "yandex.ru", "character.ai", "huggingface.co",
+)
+
+
+def is_blocked(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    return any(host == b or host.endswith("." + b) for b in BLOCKED_HOSTS)
+
+
+_ALL_TARGETS = parse_targets(os.getenv("TARGETS") or DEFAULT_TARGETS)
+BLOCKED_TARGETS = [t for t in _ALL_TARGETS if is_blocked(t)]
+TARGETS = [t for t in _ALL_TARGETS if not is_blocked(t)]
 CLICK_TTL = int(os.getenv("CLICK_TTL_DAYS", "30")) * 86400
 KV_URL = env_by_suffix("KV_REST_API_URL", "UPSTASH_REDIS_REST_URL")
 KV_TOKEN = env_by_suffix("KV_REST_API_TOKEN", "UPSTASH_REDIS_REST_TOKEN")
@@ -139,9 +158,13 @@ app = FastAPI(title="cookies_rotator", docs_url=None, redoc_url=None, openapi_ur
 
 
 @app.api_route("/", methods=["GET", "HEAD"])
+@app.api_route("/go", methods=["GET", "HEAD"])
 async def redirect(request: Request):
     if request.method == "HEAD":
         return Response(headers=NO_CACHE)
+    if not TARGETS:
+        return JSONResponse({"error": "no allowed targets", "blocked": len(BLOCKED_TARGETS)},
+                            status_code=503, headers=NO_CACHE)
     if is_bot(request):
         try:
             await kv("INCR", "rr:bots")
@@ -226,7 +249,8 @@ async def health():
         redis_ok = True
     except KVError:
         redis_ok = False
-    return {"ok": True, "redis": redis_ok, "targets": TARGETS}
+    return {"ok": True, "redis": redis_ok, "targets": TARGETS,
+            "blocked_targets": len(BLOCKED_TARGETS)}
 
 
 # Vercel может передать функции путь с префиксом /api/index, срезаем его
